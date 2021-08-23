@@ -1,3 +1,6 @@
+//! A fast key-value store with ACID guarentees written in pure Rust.
+
+
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
 use tokio::io::{BufWriter, BufReader};
@@ -9,7 +12,6 @@ use std::io::{Error, ErrorKind};
 use std::path::{PathBuf, Path};
 use std::convert::TryInto;
 use std::sync::Arc;
-// use std::sync::Mutex;
 use std::time::{Instant, Duration};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -48,7 +50,6 @@ struct DBInner {
     kv_store: KVStoreHandle,
     /// The oracle checking commit conflicts.
     oracle: OracleHandle,
-    // oracle: Mutex<u128>,
     /// The VLog file. TODO Add multiple of them which are written at once.
     vlog: VLogHandle,
 }
@@ -68,7 +69,6 @@ impl DB {
 
         let oracle = Oracle::new(3_000_000, 100_000);
         let oracle = oracle.run();
-        // let oracle = Mutex::new(0);
 
         let inner = Arc::new(DBInner {
             kv_store,
