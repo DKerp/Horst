@@ -1,4 +1,4 @@
-use horst2::*;
+use horst::*;
 
 use std::time::Instant;
 use std::convert::TryInto;
