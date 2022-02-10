@@ -22,6 +22,7 @@ pub enum OracleResp {
     FinishCommit,
 }
 
+#[derive(Clone, Debug)]
 pub struct OracleHandle {
     sender: mpsc::UnboundedSender<(OracleReq, oneshot::Sender<OracleResp>)>,
 }
@@ -102,12 +103,16 @@ pub struct Oracle {
     /// The store taking note of the latest commit stamps for all keys.
     pub commit_store: Vec<(u128, u128)>,
     /// The configured maximum length of the store.
-    pub commit_store_max_length: usize,
+    pub commit_store_max_size: usize,
     /// A small buffer for incomming commits, which are regularely merged with the main store.
     pub commit_buffer: BTreeMap<u128, u128>,
-    /// The thereshold size for commits, where commits that a bigger then this value are directly
+    /// The thereshold size for commits, where commits that are bigger then this value are directly
     /// merged with the main store.
     pub commit_buffer_thereshold: usize,
+    /// The maximum size of the commit buffer.
+    pub commit_buffer_max_size: usize,
+    // /// The interval at which the buffer gets merged into the main store.
+    // pub commit_buffer_merge_interval: Duration,
 
     /// The latest commit timestamp.
     pub commit_ts: u128,
@@ -125,14 +130,15 @@ pub struct Oracle {
 
 impl Oracle {
     pub fn new(
-        commit_store_max_length: usize,
-        commit_buffer_thereshold: usize,
+        config: &Config,
     ) -> Self {
         Self {
-            commit_store: Vec::with_capacity(2*commit_store_max_length),
-            commit_store_max_length,
+            commit_store: Vec::with_capacity(2*config.oracle_store_max_size),
+            commit_store_max_size: config.oracle_store_max_size,
             commit_buffer: BTreeMap::new(),
-            commit_buffer_thereshold,
+            commit_buffer_thereshold: config.oracle_commit_thereshold,
+            commit_buffer_max_size: config.oracle_buffer_max_size,
+            // commit_buffer_merge_interval: config.oracle_merge_interval,
             commit_ts: 0,
             read_ts: 0,
             minimal_ts: 0,
@@ -154,7 +160,7 @@ impl Oracle {
 
     /// The main loop of the oracle background task.
     async fn run_inner(mut self, mut rx: mpsc::UnboundedReceiver<(OracleReq, oneshot::Sender<OracleResp>)>) {
-        let mut interval = tokio::time::interval(Duration::from_millis(30_000)); // Tick 0.2 times per second.
+        // let mut interval = tokio::time::interval(Duration::from_millis(30_000)); // Tick 0.2 times per second.
 
         loop {
             tokio::select! {
@@ -193,22 +199,41 @@ impl Oracle {
                     };
 
                     tx.send(resp).unwrap();
-                }
 
-                _ = interval.tick() => {
-                    // log::info!("VLog - next tick. txn_buffer.len(): {}", txn_buffer.len());
+                    if self.commit_buffer.len()>self.commit_buffer_max_size {
+                        log::warn!("Oracle - merging store with temp store - temp len: {}", self.commit_buffer.len());
 
-                    if self.commit_buffer.is_empty() {
-                        continue;
+                        let start = Instant::now();
+                        self.merge();
+                        let elapsed = start.elapsed();
+
+                        log::warn!("Oracle - merging store with temp store took {:?}", elapsed);
                     }
 
-                    log::warn!("Oracle - merging store with temp store - temp len: {}", self.commit_buffer.len());
-
-                    self.merge();
-                    if self.commit_store.len()>self.commit_store_max_length {
+                    if (self.commit_store.len()+self.commit_buffer.len())>self.commit_store_max_size {
                         self.delete_old_records();
                     }
                 }
+
+                // _ = interval.tick() => {
+                //     // log::info!("VLog - next tick. txn_buffer.len(): {}", txn_buffer.len());
+                //
+                //     if self.commit_buffer.is_empty() {
+                //         continue;
+                //     }
+                //
+                //     log::warn!("Oracle - merging store with temp store - temp len: {}", self.commit_buffer.len());
+                //
+                //     let start = Instant::now();
+                //     self.merge();
+                //     let elapsed = start.elapsed();
+                //
+                //     log::warn!("Oracle - merging store with temp store took {:?}", elapsed);
+                //
+                //     if (self.commit_store.len()+self.commit_buffer.len())>self.commit_store_max_length {
+                //         self.delete_old_records();
+                //     }
+                // }
             }
         }
     }
@@ -290,7 +315,7 @@ impl Oracle {
 
     pub fn commit(
         &mut self,
-        mut keys: Vec<u128>,
+        keys: Vec<u128>,
     ) -> u128 {
         // Create the commit timestamp.
         self.commit_ts = self.commit_ts+1;
@@ -301,70 +326,52 @@ impl Oracle {
         if self.commit_buffer_thereshold>keys.len() {
             // Add the commit to the buffer.
 
-            for key in keys.drain(..) {
+            for key in keys {
                 self.commit_buffer.insert(key, commit_ts);
             }
         } else {
             // Add the commit direclty.
 
-            // Create a store for the new keys.
-            let mut new_keys = Vec::with_capacity(keys.len());
-            // Create a store for the final indexes of the new keys.
-            let mut new_keys_indexes = Vec::with_capacity(keys.len());
-            // We count how many new keys have been added (virtually) to the merged slice.
-            let mut counter = 0usize;
+            let merged_store_capacity = (self.commit_store.len()+keys.len()).max(2*self.commit_store_max_size);
+            let merged_store = Vec::with_capacity(merged_store_capacity);
 
-            // Update the commit timestamps of known keys an collect the indexes of the new keys.
-            for key in keys.drain(..) {
-                match self.find_key(key) {
-                    Ok(idx) => {
-                        self.commit_store.get_mut(idx).unwrap().1 = commit_ts;
-                    }
-                    Err(idx) => {
-                        new_keys.push((key, commit_ts));
-                        new_keys_indexes.push(idx+counter);
-                        // self.commit_store.insert(idx, (key, commit_ts));
-                        counter = counter+1;
-                    }
-                }
-            }
+            let commit_store = std::mem::replace(&mut self.commit_store, merged_store);
 
-            self.commit_store = merge_sorted_with_indexes(&mut self.commit_store, new_keys, new_keys_indexes);
+            let store_iter = commit_store.into_iter();
+            let keys_iter = keys.into_iter().zip([commit_ts].into_iter().cycle());
+
+            merge_sorted(
+                &mut self.commit_store,
+                store_iter,
+                keys_iter,
+            );
         }
 
         commit_ts
     }
 
     pub fn merge(&mut self) {
-        // Create a store for the new keys.
-        let mut new_keys = Vec::with_capacity(self.commit_buffer.len());
-        // Create a store for the final indexes of the new keys.
-        let mut new_keys_indexes = Vec::with_capacity(self.commit_buffer.len());
-        // We count how many new keys have been added (virtually) to the merged slice.
-        let mut counter = 0usize;
 
-        // Update the commit timestamps of known keys an collect the indexes of the new keys.
-        for (&key, &commit_ts) in self.commit_buffer.iter() {
-            match self.find_key(key) {
-                Ok(idx) => {
-                    self.commit_store.get_mut(idx).unwrap().1 = commit_ts;
-                }
-                Err(idx) => {
-                    new_keys.push((key, commit_ts));
-                    new_keys_indexes.push(idx+counter);
-                    counter = counter+1;
-                }
-            }
-        }
+        let merged_store_capacity = (self.commit_store.len()+self.commit_buffer.len()).max(2*self.commit_store_max_size);
+        let merged_store = Vec::with_capacity(merged_store_capacity);
 
-        self.commit_store = merge_sorted_with_indexes(&mut self.commit_store, new_keys, new_keys_indexes);
-        self.commit_buffer.clear();
+        let commit_store = std::mem::replace(&mut self.commit_store, merged_store);
+        let commit_buffer = std::mem::replace(&mut self.commit_buffer, BTreeMap::new());
+
+        let store_iter = commit_store.into_iter();
+        let buffer_iter = commit_buffer.into_iter();
+
+        merge_sorted(
+            &mut self.commit_store,
+            store_iter,
+            buffer_iter,
+        );
     }
 
     pub fn delete_old_records(&mut self) {
         log::warn!("Oracle.delete_old_records triggered. self.read_ts: {}, self.minimal_ts: {}", self.read_ts, self.minimal_ts);
 
-        let middle = (self.read_ts-self.minimal_ts)/2;
+        let middle = (self.read_ts+self.minimal_ts)/2;
         if middle==0 {
             log::warn!("Oracle.delete_old_records: middle==0 - Will not remove any records!");
             return
@@ -372,12 +379,18 @@ impl Oracle {
 
         let current = self.commit_store.len();
 
+        let start = Instant::now();
+
         self.commit_store.retain(|&(_, commit_ts)| commit_ts>=middle);
+        self.commit_buffer.retain(|_, &mut commit_ts| commit_ts>=middle);
+
+        let elapsed = start.elapsed();
+
         self.minimal_ts = middle;
 
         let dif = current - self.commit_store.len();
 
-        log::warn!("Oracle.delete_old_records: Removed {} entries.", dif);
+        log::warn!("Oracle.delete_old_records: Removed {} entries. Took {:?}", dif, elapsed);
     }
 
     fn find_key(&self, key: u128) -> Result<usize, usize> {
