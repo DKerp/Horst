@@ -19,7 +19,7 @@ async fn main() {
     config.lsm_folder = "/home/anonymous/horst2/lsm".into();
     config.oracle_store_max_size = 10_000_000;
     config.oracle_buffer_max_size = 5_000_000;
-    config.lsm_slices_per_level = 100;
+    config.lsm_slices_per_level = 5;
     config.lsm_level_zero_max_size = 1_000_000;
 
     let db = DB::open(&config).await.unwrap();
@@ -29,7 +29,7 @@ async fn main() {
     // Create x random key-value-pairs which we will try to reoptain later on.
     let start = Instant::now();
 
-    let amount = 1_000_000usize;
+    let amount = 100_000usize;
     let mut rng = rand::thread_rng();
     let mut pairs = Vec::with_capacity(amount);
     for _ in 0..amount {
@@ -145,7 +145,7 @@ async fn main() {
     let iter_store = vec![1usize, 10, 100, 1000, 10_000, 100_000];
     let iter_amount_store = vec![1_000_000usize, 100_000, 10_000, 1000, 100, 10];
 
-    for _ in 0..3 {
+    for _ in 0..10 {
         for (&iter, &iter_amount) in iter_store.iter().zip(iter_amount_store.iter()) {
 
             let mut rng = rand::thread_rng();
@@ -247,9 +247,9 @@ async fn main() {
 
         let start = Instant::now();
 
-        for (key, value) in pairs.iter() {
+        for (key, _value) in pairs.iter() {
             let key = *key;
-            let value = value.clone();
+            // let value = value.clone();
 
             let bench_store = Arc::clone(&bench_store);
 

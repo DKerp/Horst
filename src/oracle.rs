@@ -175,7 +175,7 @@ impl Oracle {
                             OracleResp::GetReadTs(self.read_ts)
                         }
                         OracleReq::Commit(keys_read, keys_set, read_ts) => {
-                            let resp = if self.would_conflict(keys_read, read_ts) {
+                            let resp = if self.would_conflict(&keys_read, &keys_set, read_ts) {
                                 None
                             } else {
                                 let commit_ts = self.commit(keys_set);
@@ -284,7 +284,8 @@ impl Oracle {
 
     pub fn would_conflict(
         &self,
-        keys: Vec<u128>,
+        keys_read: &Vec<u128>,
+        keys_set: &Vec<u128>,
         read_ts: u128,
     ) -> bool {
         // We do not store commit records before the minimal value, we can therefor not ensure
@@ -293,7 +294,24 @@ impl Oracle {
             return true;
         }
 
-        for &key in keys.iter() {
+        for &key in keys_read.iter() {
+            // If the key is unknown, there can not be a conflict.
+            if let Ok(idx) = self.find_key(key) {
+                let &(_, latest_version) = self.commit_store.get(idx).unwrap();
+                if latest_version>read_ts {
+                    return true;
+                }
+            }
+
+            // Search the buffer.
+            if let Some(&commit_ts) = self.commit_buffer.get(&key) {
+                if commit_ts>read_ts {
+                    return true;
+                }
+            }
+        }
+
+        for &key in keys_set.iter() {
             // If the key is unknown, there can not be a conflict.
             if let Ok(idx) = self.find_key(key) {
                 let &(_, latest_version) = self.commit_store.get(idx).unwrap();

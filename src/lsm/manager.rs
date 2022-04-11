@@ -218,6 +218,7 @@ impl LSMManager {
         mut rx: mpsc::UnboundedReceiver<(LSMManagerReq, oneshot::Sender<std::io::Result<LSMManagerResp>>)>,
     ) {
         let (slice_tx, mut slice_rx) = mpsc::unbounded_channel();
+        let (merged_slice_tx, mut merged_slice_rx) = mpsc::unbounded_channel();
 
         loop {
             tokio::select! {
@@ -238,7 +239,10 @@ impl LSMManager {
                             };
 
                             let resp = match resp {
-                                Some(pairs) => self.add_new_slice(pairs).await.map(|_| LSMManagerResp::Insert),
+                                Some(pairs) => {
+                                    self.add_new_slice(pairs, &merged_slice_tx).await
+                                        .map(|_| LSMManagerResp::Insert)
+                                }
                                 None => Ok(LSMManagerResp::Insert),
                             };
 
@@ -264,12 +268,24 @@ impl LSMManager {
                         SliceResp::Get(get_req) => {
                             self.get(get_req, slice_tx.clone());
                         }
-                        SliceResp::Merge(_) => {
-                            panic!("Implementation error!");
-                        }
+                        // SliceResp::Merge(_) => {
+                        //     panic!("Implementation error!");
+                        // }
                         SliceResp::Delete => {
                             panic!("Implementation error!");
                         }
+                    }
+                }
+
+                slice = merged_slice_rx.recv() => {
+                    let slice = slice.unwrap(); // We keep a sender half here, so this is never None.
+
+                    let (slice, to_be_removed) = slice.unwrap(); // TODO err handling...
+
+                    self.add_slice(slice, &merged_slice_tx).await.unwrap();
+
+                    for id in to_be_removed {
+                        self.remove_slice(id).await.unwrap();
                     }
                 }
             }
@@ -317,6 +333,7 @@ impl LSMManager {
     async fn add_new_slice(
         &mut self,
         pairs: Vec<KVPair>,
+        merged_slice_tx: &mpsc::UnboundedSender<std::io::Result<(Slice, Vec<u128>)>>,
     ) -> std::io::Result<()> {
         let start = Instant::now();
 
@@ -330,7 +347,7 @@ impl LSMManager {
 
         let slice = self.create_slice(pairs, min_ts, max_ts).await?;
 
-        self.add_slice(slice).await?;
+        self.add_slice(slice, merged_slice_tx).await?;
 
         let elapsed = start.elapsed();
         log::warn!("Added new slice to the LSM. Took {:?}.", elapsed);
@@ -354,96 +371,123 @@ impl LSMManager {
         Slice::new(id, level, pairs, min_ts, max_ts, folder).await
     }
 
-    fn add_slice<'a>(
-        &'a mut self,
+    async fn add_slice(
+        &mut self,
         slice: Slice,
-    ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> {
-        // This a recursive async fn, therefore we have to use the explicitly boxxed version.
-        Box::pin(async move {
-            // Initialize all lower level lists. This is necessary because we search the levels in order
-            // while searching for a key and after a merge a in-between level might be empty.
-            // The search ends with the first non-existing level and NOT with the first empty level!
-            // TODO make sure this gets only used during start up.
-            let mut level = 1u64;
-            while slice.level>level {
-                if let None = self.slices.get(&level) {
-                    self.slices.insert(level, Vec::with_capacity(self.slices_per_level));
-                }
-
-                level += 1;
+        merged_slice_tx: &mpsc::UnboundedSender<std::io::Result<(Slice, Vec<u128>)>>,
+    ) -> std::io::Result<()> {
+        // Initialize all lower level lists. This is necessary because we search the levels in order
+        // while searching for a key and after a merge a in-between level might be empty.
+        // The search ends with the first non-existing level and NOT with the first empty level!
+        // TODO make sure this gets only used during start up.
+        let mut level = 1u64;
+        while slice.level>level {
+            if let None = self.slices.get(&level) {
+                self.slices.insert(level, Vec::with_capacity(self.slices_per_level));
             }
 
-            // Get the list where the slice is to be inserted.
-            // We perform the possibly necessary merging here to avoid borrow rules violations.
-            let list = match self.slices.get_mut(&slice.level) {
-                Some(list) => {
-                    // Merge the current level if necessary.
-                    if list.len()>=self.slices_per_level {
-                        let list = list.split_off(0);
+            level += 1;
+        }
 
-                        // Create a merged slice out of the current slices in the level.
-                        let merged_slice = self.merge_level(list).await?;
+        // Get the list where the slice is to be inserted.
+        // We perform the possibly necessary merging here to avoid borrow rules violations.
+        let list = match self.slices.get_mut(&slice.level) {
+            Some(list) => list,
+            None => {
+                let list = Vec::with_capacity(self.slices_per_level);
+                self.slices.insert(slice.level, list);
 
-                        // Add the merged slice to the next level.
-                        self.add_slice(merged_slice).await?;
+                self.slices.get_mut(&slice.level).unwrap()
+            }
+        };
 
-                        self.slices.get_mut(&slice.level).unwrap()
-                    } else {
-                        list
-                    }
-                }
-                None => {
-                    let list = Vec::with_capacity(self.slices_per_level);
-                    self.slices.insert(slice.level, list);
+        // Merge the current level if necessary.
+        let amount = list.iter().filter(|slice| !slice.merging).count();
+        if amount>=self.slices_per_level {
+            log::warn!("LSMManager.add_slice - Merge triggered - amount: {}", amount);
 
-                    self.slices.get_mut(&slice.level).unwrap()
-                }
-            };
+            // Get the next id.
+            self.latest_id += 1;
+            let id = self.latest_id;
 
-            // Add the slice to the list and sort the list aterwards.
-            let slice = slice.run();
-            list.push(slice);
-            list.sort_by_key(|slice| slice.min_ts);
+            let folder = self.folder.clone();
 
-            Ok(())
-        })
+            Self::merge_level(
+                list,
+                amount,
+                folder,
+                id,
+                merged_slice_tx.clone(),
+            ).await?;
+        }
+
+        // Add the slice to the list and sort the list aterwards.
+        let slice = slice.run();
+        list.push(slice);
+        list.sort_by_key(|slice| slice.min_ts);
+
+        Ok(())
     }
 
     async fn merge_level(
-        &mut self,
-        list: Vec<SliceHandle>,
-    ) -> std::io::Result<Slice> {
-        // Determine the number of slices we are merging.
-        let amount = list.len();
-
-        // Create the channels for retrieving the slices for merging.
-        let (slice_tx, mut slice_rx) = mpsc::unbounded_channel();
-
+        list: &mut Vec<SliceHandle>,
+        amount: usize,
+        folder: PathBuf,
+        id: u128,
+        merged_slice_tx: mpsc::UnboundedSender<std::io::Result<(Slice, Vec<u128>)>>,
+    ) -> std::io::Result<()> {
         // Initialize the collection of MergeSlice's.
         let mut old = Vec::with_capacity(amount);
+        let mut to_be_removed = Vec::with_capacity(amount);
 
-        // Send the request to all slices.
-        for slice in list.iter() {
-            slice.merge(slice_tx.clone());
-        }
+        // Construct and collect all merge slices.
+        for slice in list.iter_mut().filter(|slice| !slice.merging) {
+            let merge_slice = MergeSlice::from_slice_handle(slice).await?;
 
-        // Wait for all slices to answer.
-        while amount>old.len() {
-            let merge_slice = match slice_rx.recv().await.unwrap() {
-                SliceResp::Merge(merge_slice) => merge_slice,
-                _ => panic!("Implementation error!"),
-            };
+            slice.merging = true;
 
             old.push(merge_slice);
+            to_be_removed.push(slice.id);
         }
 
-        // Get the next id.
-        self.latest_id += 1;
-        let id = self.latest_id;
-
         // Merge the slices.
-        let slice = Slice::merge_multi(old, id, self.folder.clone()).await?;
+        tokio::spawn(async move {
+            let result = Slice::merge_multi(
+                old,
+                id,
+                folder,
+            ).await;
 
-        Ok(slice)
+            let result = result.map(|slice| (slice, to_be_removed));
+
+            merged_slice_tx.send(result).unwrap();
+        });
+
+        Ok(())
+    }
+
+    async fn remove_slice(
+        &mut self,
+        id: u128,
+    ) -> std::io::Result<()> {
+        for (_, list) in self.slices.iter_mut() {
+            for idx in 0..list.len() {
+                let slice = list.get(idx).unwrap(); // Can not fail.
+
+                if slice.id==id {
+                    let (slice_tx, mut slice_rx) = mpsc::unbounded_channel();
+
+                    slice.delete(slice_tx);
+
+                    slice_rx.recv().await.unwrap();
+
+                    list.remove(idx);
+
+                    return Ok(())
+                }
+            }
+        }
+
+        Err(Error::new(ErrorKind::NotFound, "Slice which was meant to be removed could not be found."))
     }
 }

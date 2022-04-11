@@ -87,8 +87,8 @@ impl LoadFromDisk for SliceHeader {
 pub enum SliceReq {
     /// Retrieve a cetain key from the lsm tree. Gives back the newest version before or at the given read timestamp.
     Get(SliceGetReq),
-    /// Request a merge slice copy.
-    Merge,
+    // /// Request a merge slice copy.
+    // Merge,
     /// Request the deletion of the slice.
     Delete,
 }
@@ -97,8 +97,8 @@ pub enum SliceReq {
 pub enum SliceResp {
     /// The response to a get request. If the [`KVPair`] was found it gets added to the [`SliceGetReq`].
     Get(SliceGetReq),
-    /// The response to a merge request.
-    Merge(MergeSlice),
+    // /// The response to a merge request.
+    // Merge(MergeSlice),
     /// The empty response to a deletion request.
     Delete,
 }
@@ -141,6 +141,10 @@ pub struct SliceHandle {
     pub id: u128,
     pub min_ts: u128,
     pub max_ts: u128,
+    pub path: PathBuf,
+    pub len: u64,
+    pub level: u64,
+    pub merging: bool,
     pub sender: mpsc::UnboundedSender<(SliceReq, mpsc::UnboundedSender<SliceResp>)>,
 }
 
@@ -172,11 +176,18 @@ impl SliceHandle {
         let id = slice.id;
         let min_ts = slice.min_ts;
         let max_ts = slice.max_ts;
+        let len = slice.len;
+        let level = slice.level;
+        let path = slice.path.clone();
 
         Self {
             id,
             min_ts,
             max_ts,
+            path,
+            len,
+            level,
+            merging: false,
             sender,
         }
     }
@@ -193,14 +204,14 @@ impl SliceHandle {
         self.sender.send((req, tx)).unwrap();
     }
 
-    pub fn merge(
-        &self,
-        tx: mpsc::UnboundedSender<SliceResp>,
-    ) {
-        let req = SliceReq::Merge;
-
-        self.sender.send((req, tx)).unwrap();
-    }
+    // pub fn merge(
+    //     &self,
+    //     tx: mpsc::UnboundedSender<SliceResp>,
+    // ) {
+    //     let req = SliceReq::Merge;
+    //
+    //     self.sender.send((req, tx)).unwrap();
+    // }
 
     pub fn delete(
         &self,
@@ -413,19 +424,23 @@ impl Slice {
                                 Err(err) => get_req.tx.send(Err(err)).unwrap(),
                             }
                         }
-                        SliceReq::Merge => {
-                            // TODO add err handler...
-                            let merge_slice = MergeSlice::from_slice(self).await.unwrap();
+                        // SliceReq::Merge => {
+                        //     // TODO add err handler...
+                        //     let merge_slice = MergeSlice::from_slice(self).await.unwrap();
+                        //
+                        //     log::warn!("Merge - Successfully seeked to the beginning.");
+                        //
+                        //     let resp = SliceResp::Merge(merge_slice);
+                        //
+                        //     tx.send(resp).unwrap();
+                        //     break;
+                        // }
+                        SliceReq::Delete => {
+                            fs::remove_file(&self.path).await.unwrap();
 
-                            log::warn!("Merge - Successfully seeked to the beginning.");
-
-                            let resp = SliceResp::Merge(merge_slice);
+                            let resp = SliceResp::Delete;
 
                             tx.send(resp).unwrap();
-                            break;
-                        }
-                        SliceReq::Delete => {
-                            panic!("Implementation error!");
                         }
                     }
                 }
@@ -696,15 +711,15 @@ impl Slice {
     pub async fn merge_multi(
         mut old: Vec<MergeSlice>,
         id: u128,
-        folder: impl AsRef<Path>,
+        folder: PathBuf,
     ) -> std::io::Result<Slice> {
         let start = Instant::now();
 
-        let path = folder.as_ref().join(format!("{}.slice", id));
+        let path = folder.join(format!("{}.slice", id));
 
         old.sort();
 
-        let mut to_be_removed: Vec<MergeSlice> = Vec::with_capacity(old.len());
+        // let mut to_be_removed: Vec<MergeSlice> = Vec::with_capacity(old.len());
 
         let file = fs::OpenOptions::new()
             .read(true)
@@ -734,7 +749,7 @@ impl Slice {
             slice.read_next().await?;
         }
 
-        let mut writer = BufWriter::new(file);
+        let mut writer = BufWriter::with_capacity(16*1024*1024, file);
 
         let header = SliceHeader {
             id,
@@ -774,8 +789,8 @@ impl Slice {
             // Load the next element from the slice we just took the pair from.
             let element = old.get_mut(idx_min).unwrap();
             if element.read_next().await? {
-                let element = old.remove(idx_min);
-                to_be_removed.push(element);
+                old.remove(idx_min);
+                // to_be_removed.push(element);
             }
         }
 
@@ -790,10 +805,10 @@ impl Slice {
         // Open the newly created slice.
         let slice = Slice::open(&path).await?;
 
-        // Delete the old slices from the disk.
-        for slice in to_be_removed {
-            slice.remove().await?;
-        }
+        // // Delete the old slices from the disk.
+        // for slice in to_be_removed {
+        //     slice.remove().await?;
+        // }
 
         let elapsed = start.elapsed();
         log::warn!("Merged multiple slices. Took {:?}.", elapsed);
@@ -807,7 +822,6 @@ impl Slice {
 /// Defines a util structure for performing the slice merge.
 #[derive(Debug)]
 pub struct MergeSlice {
-    path: PathBuf,
     file: BufReader<fs::File>,
     len: u64,
     level: u64,
@@ -839,7 +853,7 @@ impl Ord for MergeSlice {
 }
 
 impl MergeSlice {
-    async fn from_slice(inner: Slice) -> std::io::Result<Self> {
+    pub async fn from_slice_handle(inner: &SliceHandle) -> std::io::Result<Self> {
         let mut file = fs::OpenOptions::new()
             .read(true)
             .open(&inner.path)
@@ -851,16 +865,17 @@ impl MergeSlice {
 
         file.seek(SeekFrom::Start(offset)).await?;
 
-        let file = BufReader::new(file);
+        let file = BufReader::with_capacity(16*1024*1024, file);
+
+        let buffer = vec![0u8; KVPair::STATIC_SIZE as usize];
 
         Ok(Self {
-            path: inner.path,
             file,
             len: inner.len,
             level: inner.level,
             min_ts: inner.min_ts,
             max_ts: inner.max_ts,
-            buffer: inner.buffer,
+            buffer: buffer,
             current_pair: KVPair::default(),
             next_pair_nr: 0,
         })
@@ -887,7 +902,7 @@ impl MergeSlice {
     //     self.file.seek(SeekFrom::Start(offset)).await
     // }
 
-    pub async fn remove(self) -> std::io::Result<()> {
-        fs::remove_file(&self.path).await
-    }
+    // pub async fn remove(self) -> std::io::Result<()> {
+    //     fs::remove_file(&self.path).await
+    // }
 }
