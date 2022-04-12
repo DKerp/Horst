@@ -6,12 +6,26 @@ use std::sync::Mutex;
 use std::sync::atomic::{Ordering, AtomicU64};
 
 use tokio::sync::Barrier;
+use tokio::runtime::Builder;
 
 use rand::prelude::*;
 
 
-#[tokio::main]
-async fn main() {
+
+fn main() {
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .thread_name("Horst worker")
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        main_inner().await;
+    });
+}
+
+async fn main_inner() {
     pretty_env_logger::init();
 
     let mut config = Config::default();

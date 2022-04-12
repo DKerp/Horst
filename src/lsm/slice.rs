@@ -749,7 +749,7 @@ impl Slice {
             slice.read_next().await?;
         }
 
-        let mut writer = BufWriter::with_capacity(16*1024*1024, file);
+        let mut writer = BufWriter::with_capacity(16*1024, file);
 
         let header = SliceHeader {
             id,
@@ -768,6 +768,8 @@ impl Slice {
         main_header.save_to_disk(&mut writer).await?;
         header.save_to_disk(&mut writer).await?;
 
+        let mut counter = 0u32;
+
         while !old.is_empty() {
             // Find the "smallest" pair from all.
             let mut idx_min = 0;
@@ -785,6 +787,12 @@ impl Slice {
 
             // Write that pair to the merged slice.
             pair_min.save_to_disk(&mut writer).await?;
+
+            counter = counter+1;
+            if counter>=10_000 {
+                counter = 0;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
 
             // Load the next element from the slice we just took the pair from.
             let element = old.get_mut(idx_min).unwrap();

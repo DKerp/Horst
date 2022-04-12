@@ -5,7 +5,7 @@ This is a __work in progress__. Use it at your own risk.
 
 ## Status
 
-The database does currently not support durability. That means your data will be lost after a restart. You also have to manually delete the data from the directory. There is also no shapshot creation mechanism, which means outdated data is never deleted. Finally there is currently no way to delete a certain key from the database.
+The database does not yet support durability. That means your data will be lost after a restart. You also currently have to manually delete the data from the directory. There is also no shapshot creation mechanism yet, which means outdated data is never deleted. Finally there is currently no way to delete a certain key from the database.
 
 Everything else is working correctly and can in theory already be used.
 
@@ -13,7 +13,7 @@ Everything else is working correctly and can in theory already be used.
 
 The implementation closely follows the way [Badger](https://github.com/dgraph-io/badger) got implemented, as the [Dgraph](https://dgraph.io) team explained [in their blog post](https://dgraph.io/blog/post/badger-txn/). Given so Horst's transactions offer the some ACID guarantees as [Badger](https://github.com/dgraph-io/badger) does.
 
-We maintain the list of pending commits s in sorted `Vec` containing `(commit_ts, finished)` elements. If a commit finishes successfully `finished` gets set to `true`, if it fails the entry gets removed. Once all transactions up to a certain `commit_ts` have been marked as finished, they all get removed from the `Vec` and the oracle's `read_ts` gets increased to that `commit_ts`.
+We maintain the list of pending commits in a sorted `Vec` containing `(commit_ts, finished)` elements. If a commit finishes successfully `finished` gets set to `true`, if it fails the entry gets removed. Once all transactions up to a certain `commit_ts` have been marked as finished, they all get removed from the `Vec` and the oracle's `read_ts` gets increased to that `commit_ts`.
 
 The value log is implemented in such a way that each `VLog` file contains solely the transactions corresponding to a certain interval of commit timestamps which is disjunct with the intervals of all other `VLog` files. This ensures we can easily detect after the creation of a snapshot which `VLog` files can be deleted and which must be preserved.
 
@@ -30,7 +30,7 @@ Contrary to [Badger](https://github.com/dgraph-io/badger) which uses byte slices
     - A `BTreeMap` gets used for quickly adding new key/commit_ts pairs.
     - If the `BTreeMap` gets too large, we merge it with the main `Vec` store.
     - If a certain commit updates too many keys, it gets directly merged into the main `Vec` store.
-    - Upon conflict detection, both stores are checked for commit_ts higher then the transactions read_ts.
+    - Upon conflict detection, both stores are checked for `commit_ts` higher then the transactions `read_ts`.
   - [x] Let the oracle keep track of pending transaction commits.
     - Successfully commited transactions get saved in a `Vec` with both the `commit_ts` and a `finished` flag defaulting to false.
     - If a transaction successfully completes a commit, it informs the oracle which will set the `finished` flag to `false`.
@@ -48,6 +48,7 @@ Contrary to [Badger](https://github.com/dgraph-io/badger) which uses byte slices
     - [x] Empty the buffer at a configuable interval.
     - [ ] Empty the buffer if a configurable size gets exceeded.
     - [ ] Make sure the transactions are given to the correct `VLog`s (s.b.).
+  - [ ] Add a cache for recently read values for better performance.
   - [x] Implement the management for opening mulitple `VLog` files.
   - [ ] Allow creating `VLog` files in multiple directories, e.g. on different harddrives.
   - [ ] Open multiple `VLog` files.
@@ -97,6 +98,25 @@ Contrary to [Badger](https://github.com/dgraph-io/badger) which uses byte slices
     - [ ] Detect not fully commited transactions and update the `Slice`s as needed.
 - Database functions
   - [ ] Implement a snapshot creation function, so outdated data gets removed.
+    - [ ] Add a function for manually triggering the creation of a snapshot.
+    - [ ] Define and implement other criteria (time interval, database size) for automatic snapshot creation.
+    - [ ] Implement a seperate task which manages shapshot creations.
+      - [ ] Make sure it returns an appropriate error if a snapshot creation is requested even trough one is currently already being created.
+    - [ ] Let it ask the LSM tree for handles to all `Slice`s saved at level 1 and above plus the current snapshot `Slice`, if any.
+      - This will also give it access to the highest `commit_ts` currently saved on disk in the LSM tree.
+      - Note that by construction that this `commit_ts` is lower or equal to the oracle's `read_ts`. In particular we can be sure there are no pending or future transactions which would belong into this snapshot.
+    - [ ] Perform a merge of all `Slice`s.
+      - This will exclude all outdated values in the newly created snapshot `Slice`.
+      - This `Slice` is only temporary, since it points to the values of the not yet merged `VLog`s.
+    - [ ] Give a handle of the new temporary snapshot `Slice` to the value log and ask it to create a snapshot `VLog` containing all values referenced by the `Slice`.
+      - [ ] Give that `VLog` a `snapshot` and `finished` flag since it will not contain a regular transaction and can not know its total size in advance.
+      - [ ] Create a new snapshot `Slice` file.
+      - [ ] Iterate over the keys in the temporary snapshot `Slice`, read the values from the old `VLog` files, add them to the new snapshot `VLog` and add a corresponding reference to the new snapshot `Slice` file.
+      - [ ] Once done, mark the new `VLog` file as `finished`,delete the temporary snapshot `Slice` and give the new snapshot `Slice` to the snapshot task.    
+    - [ ] Give the new snapshot `Slice` over to the LSM tree together with a list of the `Slice`s which got merged into it.
+      - [ ] Let the LSM tree delete all new outdated `Slice`s (including a possible old snapshot one) and add the new snapshot `Slice`.
+      - [ ] Once done inform the snapshot task of it.
+    - [ ] Tell the value log to switch to the new snaphost `VLog` and delete all `VLog` files (including a possible old snapshot one) which contain solely values with `commit_ts` lower or equal to the snapshots max `commit_ts`.
   - [ ] Implement a delete key function by adding a corresponding flag.
   - [ ] Implement an async key range iteration function. (Usefull for prefix scanning)
   - [ ] Implement key conversion functionalites.
